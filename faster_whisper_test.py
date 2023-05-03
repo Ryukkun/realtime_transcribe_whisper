@@ -1,4 +1,4 @@
-from audio_utils import display_valid_input_devices, get_valid_input_devices, create_audio_stream
+from audio_utils import display_valid_input_devices, create_audio_stream
 
 import wave
 import asyncio
@@ -112,18 +112,16 @@ if __name__ == "__main__":
     async def main():
         transcriber = AudioTranscriber()
 
-        valid_devices = get_valid_input_devices()
         print("使用可能なオーディオデバイス:")
-        display_valid_input_devices(valid_devices)
+        display_valid_input_devices()
 
         # 対象のDeviceIndexを入力
         selected_device_index = int(input("対象のDeviceIndexを入力してください: "))
 
         # 文字起こしを開始
-        task = await transcriber.start_transcription(selected_device_index)
+        await transcriber.start_transcription(selected_device_index)
 
         while True:
             await asyncio.sleep(10)
-        await task
 
     asyncio.run(main())
