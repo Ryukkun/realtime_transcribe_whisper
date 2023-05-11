@@ -7,13 +7,20 @@ import webrtcvad
 import pyaudio
 import numpy as np
 
+from typing import List, Union
+from concurrent.futures import ThreadPoolExecutor
 from faster_whisper import WhisperModel
 
 
 
 SAMPLING_RATE = 16000
-SILENT_CHUNKS = 10
-MIN_CHUNKS = 5
+SPLIT_TIME_LIMIT = 100 #ms
+MIN_PACKET_TIME = 100
+
+# Whisper
+MODULE = 'tiny'
+DEVICE = 'cpu'
+TYPE = 'float32'
 
 
 class AudioSave:
@@ -31,27 +38,74 @@ class AudioSave:
         self.i += 1
 
 class WhisperModelWrapper:
-    def __init__(self):
-        self.model_size_or_path = "tiny"
-        self.model = WhisperModel(
-            self.model_size_or_path, device="cpu", compute_type="float32"
-        )
+    exe = ThreadPoolExecutor(1)
+    model = WhisperModel(
+        MODULE, device=DEVICE, compute_type=TYPE
+    )
 
-    def transcribe(self, audio):
+    def segments(self, audio):
         segments, _ = self.model.transcribe(
             audio=audio, beam_size=2, language="ja", without_timestamps=True 
         )
         return segments
 
 
+    def transcribe(self, audio):
+        return list(self.segments(audio))
+    
+
+    async def async_transcribe(self, audio):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.exe, self.transcribe, audio)
+
+
+
 class AudioTranscriber:
-    def __init__(self):
-        self.model_wrapper = WhisperModelWrapper()
-        self.vad_wrapper = webrtcvad.Vad(0)
-        self.silent_chunks = 0
+    def __init__(self, packet_size_ms=20):
+        self.whisper = WhisperModelWrapper()
+        self.vad = webrtcvad.Vad(0)
+        self.packet_size = packet_size_ms
+        self.packet_size_ms = packet_size_ms
         self.speech_buffer = []
-        self.audio_queue = queue.Queue()
+        self.packet_buffer = []
         self.audio_save = AudioSave()
+
+
+    async def from_file(self, audio) -> List[str]:
+        return await self.whisper.async_transcribe(audio)
+
+
+    async def from_packet(self, audio:np.ndarray):
+        """リアルタイム文字起こし
+
+        Parameters
+        ----------
+        audio : np.ndarray
+            サンプリングレートは 16000Hz 
+            長さは 10ms, 20ms, 30ms
+            int16
+        """
+        audio_byte = audio.tobytes()
+        is_speech = self.vad.is_speech(audio_byte, SAMPLING_RATE)
+        #rint(f'{len(self.speech_buffer)} : {self.audio_queue.qsize()}')
+
+        if is_speech:
+            #print('True')
+            audio = audio.astype(np.float32) / 32768.0
+            self.packet_buffer.append(audio)
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._audio_split(audio))
+            
+
+
+    async def _audio_split(self, audio:np.ndarray):
+        await asyncio.sleep(SPLIT_TIME_LIMIT / 1000)
+        if self.packet_buffer:
+            if np.all(self.packet_buffer[-1] == audio):
+                if (MIN_PACKET_TIME // self.packet_size_ms) < len(self.packet_buffer):
+                    self.speech_buffer.append(np.concatenate(self.speech_buffer))
+                self.speech_buffer.clear()
+
 
     async def transcribe_audio(self):
         loop = asyncio.get_event_loop()
@@ -95,12 +149,7 @@ class AudioTranscriber:
 
         return (in_data, pyaudio.paContinue)
 
-    async def start_transcription(self, selected_device_index):
-        stream = create_audio_stream(selected_device_index, self.process_audio)
-        print("Listening...")
-        stream.start_stream()
-        loop = asyncio.get_event_loop()
-        return loop.create_task(self.transcribe_audio())
+
 
 
 
