@@ -15,11 +15,11 @@ from faster_whisper import WhisperModel
 
 SAMPLING_RATE = 16000
 SPLIT_TIME_LIMIT = 100 #ms
-MIN_PACKET_TIME = 100
+MIN_PACKET_TIME = 200
 
 # Whisper
-MODULE = 'small'
-DEVICE = 'cuda'
+MODULE = 'tiny'
+DEVICE = 'cpu'
 TYPE = 'float32'
 
 
@@ -87,7 +87,7 @@ class RealtimeAudioTranscriber:
             int16
         """
         audio_byte = audio.tobytes()
-        print(f'{len(self.speech_buffer)} : {len(self.packet_buffer)}')
+        #print(f'{len(self.speech_buffer)} : {len(self.packet_buffer)}')
         is_speech = self.vad.is_speech(audio_byte, SAMPLING_RATE)
         
 
@@ -104,7 +104,7 @@ class RealtimeAudioTranscriber:
         await asyncio.sleep(SPLIT_TIME_LIMIT / 1000)
         if self.packet_buffer:
             if self.packet_uid == res:
-                if (MIN_PACKET_TIME // self.packet_size_ms) < len(self.packet_buffer):
+                if (MIN_PACKET_TIME / self.packet_size_ms) < len(self.packet_buffer):
                     self.speech_buffer.append(np.concatenate(self.packet_buffer))
                     self.loop.create_task(self._transcribe_from_buffer())
                     print('split')
@@ -126,8 +126,8 @@ class RealtimeAudioTranscriber:
             text = segment.text
 
             # 文字数の予測
-            text_len = audio.size // SAMPLING_RATE * 10
-            if audio.size // SAMPLING_RATE * 10 < len(text):
+            text_len = audio.size / SAMPLING_RATE * 10
+            if text_len < len(text):
                 print(f'continue : {text} \n 予想文字数 : {text_len}')
                 continue
             
@@ -147,13 +147,13 @@ class RealtimeAudioTranscriber:
 if __name__ == "__main__":
 
     async def main():
-        transcriber = RealtimeAudioTranscriber()
+        transcriber = RealtimeAudioTranscriber(packet_size_ms=30)
 
         print("使用可能なオーディオデバイス:")
         display_valid_input_devices()
 
         # 対象のDeviceIndexを入力
-        #selected_device_index = int(input("対象のDeviceIndexを入力してください: "))
+        selected_device_index = int(input("対象のDeviceIndexを入力してください: "))
         loop = asyncio.get_event_loop()
 
         def process_audio(in_data, frame_count, time_info, status):
@@ -162,9 +162,11 @@ if __name__ == "__main__":
             print('kitya!',end='')
             return (in_data, pyaudio.paContinue)
 
-        def process_loop(stream:pyaudio.Stream):
+        async def process_loop(stream:pyaudio.Stream):
             while True:
-                audio = np.frombuffer( stream.read(480), dtype=np.int16)
+                exe = ThreadPoolExecutor(1)
+                audio = await loop.run_in_executor(exe, stream.read, 480, False)
+                audio = np.frombuffer( audio, dtype=np.int16)
                 transcriber.from_packet(audio)
 
 
@@ -180,12 +182,12 @@ if __name__ == "__main__":
                 channels=CHANNELS,
                 rate=RATE,
                 input=True,
-                input_device_index=2,
+                input_device_index=selected_device_index,
                 frames_per_buffer=CHUNK,
             )
 
             print("Listening...")
-            await loop.run_in_executor(None, process_loop, stream)
+            await process_loop( stream)
 
 
 
