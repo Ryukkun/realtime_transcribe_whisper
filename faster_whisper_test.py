@@ -6,6 +6,7 @@ import wave
 import asyncio
 import webrtcvad
 import pyaudio
+import time
 import numpy as np
 
 from typing import List, Union, Optional, Literal
@@ -122,8 +123,8 @@ class RealtimeAudioTranscriber:
         self.packet_size:Optional[int] = None
         self.speech_buffer = []
         self.packet_buffer = []
-        self.loop = asyncio.get_event_loop()
         self.last_packet_id = 0
+        self.split_task:asyncio.Task = None
         #self.audio_save = AudioSave()
 
 
@@ -154,27 +155,42 @@ class RealtimeAudioTranscriber:
         is_speech = self.vad.is_speech(audio_byte, SAMPLING_RATE)
         
         if is_speech:
-            print('True')
+            #print('True')
             if not isinstance(audio_np, np.ndarray):
                 audio_np = np.frombuffer(audio_byte, dtype=np.int16)
             if self.packet_size == None:
                 self.packet_size = audio_np.size / SAMPLING_RATE
             audio_np = audio_np.astype(np.float32) / 32768.0
-            self.packet_buffer.append(audio_np)
+            self.packet_buffer.append({'data':audio_np, 'id':self.last_packet_id, 'time':time.perf_counter()})
             self.last_packet_id += 1
-            asyncio.create_task(self._audio_split(self.last_packet_id))
+            if not self.split_task == None:
+                loop = asyncio.get_event_loop()
+                self.split_task = loop.create_task(self._audio_split())
             
 
 
-    async def _audio_split(self, id):
-        await asyncio.sleep(self.split_timelimit / 1000)
+    async def _audio_split(self):
+        _id = None
+        while self.packet_buffer:
+            packet = self.packet_buffer[-1]
+            if packet['id'] == _id:
+                break
+            
+            else:
+                _id = packet['id']
+                sleep_time = (self.split_timelimit / 1000) - (time.perf_counter() - packet['time'])
+                #print(sleep_time)
+                if 0 < sleep_time:
+                    await asyncio.sleep(sleep_time)
+                
         if self.packet_buffer:
-            if self.last_packet_id == id:
-                if (self.min_chunksize / self.packet_size) < len(self.packet_buffer):
-                    self.speech_buffer.append(np.concatenate(self.packet_buffer))
-                    asyncio.create_task(self._transcribe_from_buffer())
-                    print('split')
-                self.packet_buffer.clear()
+            if (self.min_chunksize / self.packet_size) < len(self.packet_buffer):
+                self.speech_buffer.append(np.concatenate([_['data'] for _ in self.packet_buffer]))
+                asyncio.create_task(self._transcribe_from_buffer())
+                print('split')
+            self.packet_buffer.clear()
+
+        self.split_task = None
 
 
     async def _transcribe_from_buffer(self):
@@ -184,7 +200,7 @@ class RealtimeAudioTranscriber:
         exe = self.whisper.exe
         audio = self.speech_buffer.pop(0)
         loop = asyncio.get_event_loop()
-        await asyncio.run_in_executor(exe, self.__transcribe_from_buffer, audio, loop)
+        await loop.run_in_executor(exe, self.__transcribe_from_buffer, audio, loop)
 
 
     def __transcribe_from_buffer(self, audio:np.ndarray, loop:asyncio.BaseEventLoop):
@@ -213,7 +229,7 @@ class RealtimeAudioTranscriber:
 
 if __name__ == "__main__":
 
-    def main():
+    async def main():
         transcriber = RealtimeAudioTranscriber()
 
         print("使用可能なオーディオデバイス:")
@@ -222,16 +238,21 @@ if __name__ == "__main__":
         # 対象のDeviceIndexを入力
         selected_device_index = int(input("対象のDeviceIndexを入力してください: "))
         loop = asyncio.get_event_loop()
+        # asyncio.set_event_loop(loop)
+        # exe = ThreadPoolExecutor(1)
+        # exe.submit(loop.run_forever)
 
 
         def process_loop(stream:pyaudio.Stream):
+            asyncio.set_event_loop(loop)
             while True:
+                #print('kita!',end='')
                 audio = stream.read( 480)
                 audio = np.frombuffer( audio, dtype=np.int16)
                 transcriber.from_packet(audio)
 
 
-        def run():
+        async def run():
             CHUNK = 480
             FORMAT = pyaudio.paInt16
             CHANNELS = 1
@@ -247,16 +268,17 @@ if __name__ == "__main__":
             )
 
             print("Listening...")
-            exe = ThreadPoolExecutor(1)
-            task = exe.submit(process_loop, stream)
-            task.result()
-
+            #process_loop(stream)
+            await loop.run_in_executor(None, process_loop, stream)
 
 
 
         # 文字起こしを開始
-        run()
+        loop.create_task(run())
+
+        while True:
+            await asyncio.sleep(10)
 
 
-    main()
+    asyncio.run(main())
     #asyncio.get_event_loop().run_until_complete(main())
