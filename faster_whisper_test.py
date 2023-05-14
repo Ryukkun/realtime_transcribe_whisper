@@ -1,6 +1,3 @@
-from audio_utils import display_valid_input_devices, create_audio_stream
-
-from ctranslate2 import get_cuda_device_count
 import pyaudio
 import wave
 import asyncio
@@ -9,6 +6,7 @@ import pyaudio
 import time
 import numpy as np
 
+from ctranslate2 import get_cuda_device_count
 from typing import List, Union, Optional, Literal
 from concurrent.futures import ThreadPoolExecutor
 from faster_whisper import WhisperModel
@@ -16,21 +14,10 @@ from faster_whisper import WhisperModel
 
 
 SAMPLING_RATE = 16000
+CHUNK = 480
+CHANNELS = 1
 
 
-class AudioSave:
-    def __init__(self) -> None:
-        self.i = 0
-        self.ac = 1
-        self.abit = 2
-
-    def save(self, data):
-        with wave.Wave_write(f'{self.i}.wav') as f:
-            f.setsampwidth(self.abit)
-            f.setnchannels(self.ac)
-            f.setframerate(SAMPLING_RATE)
-            f.writeframes(data)
-        self.i += 1
 
 class WhisperModelWrapper:
     def __init__(self, model:Optional[str]=None, device:Optional[str]=None, _type:Optional[str]=None) -> None:
@@ -57,10 +44,8 @@ class WhisperModelWrapper:
         )
         return segments
 
-
     def transcribe(self, audio):
         return list(self.segments(audio))
-    
 
     async def async_transcribe(self, audio):
         loop = asyncio.get_event_loop()
@@ -71,7 +56,6 @@ class Vad(webrtcvad.Vad):
     def __init__(self, mode=None):
         self.mode:int
         super().__init__(mode)
-        
 
     def set_mode(self, mode):
         super().set_mode(mode)
@@ -82,7 +66,7 @@ class RealtimeAudioTranscriber:
     def __init__(self, 
                  vad_mode:int=1, 
                  split_timelimit:int=100, 
-                 min_chunksize:int=200,
+                 min_chunksize:int=300,
                  whisper_device:Literal['cpu', 'cuda', 'auto'] = 'auto',
                  whisper_module:str = 'tiny',
                  whisper_type:str = 'float32',
@@ -124,7 +108,7 @@ class RealtimeAudioTranscriber:
         self.speech_buffer = []
         self.packet_buffer = []
         self.last_packet_id = 0
-        self.split_task:asyncio.Task = None
+        self.split_task = None
         #self.audio_save = AudioSave()
 
 
@@ -132,7 +116,7 @@ class RealtimeAudioTranscriber:
         return await self.whisper.async_transcribe(audio)
 
 
-    def from_packet(self, audio:Union[bytes,np.ndarray]):
+    async def from_packet(self, audio:Union[bytes,np.ndarray]):
         """
         サンプリングレートは 16000Hz
         ビット数は int16にしてくれよん
@@ -155,18 +139,16 @@ class RealtimeAudioTranscriber:
         is_speech = self.vad.is_speech(audio_byte, SAMPLING_RATE)
         
         if is_speech:
-            #print('True')
             if not isinstance(audio_np, np.ndarray):
                 audio_np = np.frombuffer(audio_byte, dtype=np.int16)
             if self.packet_size == None:
-                self.packet_size = audio_np.size / SAMPLING_RATE
+                self.packet_size = audio_np.size / SAMPLING_RATE * 1000
             audio_np = audio_np.astype(np.float32) / 32768.0
             self.packet_buffer.append({'data':audio_np, 'id':self.last_packet_id, 'time':time.perf_counter()})
             self.last_packet_id += 1
-            if not self.split_task == None:
+            if self.split_task == None:
                 loop = asyncio.get_event_loop()
                 self.split_task = loop.create_task(self._audio_split())
-            
 
 
     async def _audio_split(self):
@@ -186,38 +168,50 @@ class RealtimeAudioTranscriber:
         if self.packet_buffer:
             if (self.min_chunksize / self.packet_size) < len(self.packet_buffer):
                 self.speech_buffer.append(np.concatenate([_['data'] for _ in self.packet_buffer]))
-                asyncio.create_task(self._transcribe_from_buffer())
-                print('split')
+                self._transcribe_from_buffer()
+                #print('split')
             self.packet_buffer.clear()
 
         self.split_task = None
 
 
-    async def _transcribe_from_buffer(self):
+    def _transcribe_from_buffer(self):
         if not self.speech_buffer:
             return
         
         exe = self.whisper.exe
         audio = self.speech_buffer.pop(0)
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(exe, self.__transcribe_from_buffer, audio, loop)
+        exe.submit(self.__transcribe_from_buffer, audio, loop)
 
 
     def __transcribe_from_buffer(self, audio:np.ndarray, loop:asyncio.BaseEventLoop):
         segments = self.whisper.segments(audio)
+        black_list = ['ご視聴ありがとうございました','ご視聴ありがとうございます' , 'チャンネル登録','次の動画でお会いしましょう']
+        
         for segment in segments:
             text = segment.text
 
             # 文字数の予測
-            text_len = audio.size / SAMPLING_RATE * 12
-            if text_len < len(text) < 30:
-                print(f'continue : {text} \n 予想文字数 : {text_len}')
-                continue
+            audio_size = audio.size / SAMPLING_RATE
+
+            if len(text) < 50:
+                if (audio_size*13) < len(text): 
+                    #print(f'continue : {text} , 予想 : {audio_size*12}')
+                    continue
+
+                if (audio_size*8) < len(text):
+                    #print('予測以上',end=' : ')
+                    for _ in black_list:
+                        if _ in text:
+                            #print(f'continue : {text}')
+                            continue
             
-            loop.create_task(self.callback(text))
+            asyncio.run_coroutine_threadsafe(self.callback(text), loop)
 
 
-    async def callback(self, text):
+
+    async def callback(self, text:str):
         print(text)
 
 
@@ -229,56 +223,42 @@ class RealtimeAudioTranscriber:
 
 if __name__ == "__main__":
 
-    async def main():
-        transcriber = RealtimeAudioTranscriber()
+    transcriber = RealtimeAudioTranscriber(whisper_module='small')
 
-        print("使用可能なオーディオデバイス:")
-        display_valid_input_devices()
+    print("使用可能なオーディオデバイス:")
+    audio = pyaudio.PyAudio()
+    device_count = audio.get_device_count()
+    default_host_api_index = audio.get_default_host_api_info()["index"]
 
-        # 対象のDeviceIndexを入力
-        selected_device_index = int(input("対象のDeviceIndexを入力してください: "))
-        loop = asyncio.get_event_loop()
-        # asyncio.set_event_loop(loop)
-        # exe = ThreadPoolExecutor(1)
-        # exe.submit(loop.run_forever)
-
-
-        def process_loop(stream:pyaudio.Stream):
-            asyncio.set_event_loop(loop)
-            while True:
-                #print('kita!',end='')
-                audio = stream.read( 480)
-                audio = np.frombuffer( audio, dtype=np.int16)
-                transcriber.from_packet(audio)
+    for i in range(device_count):
+        device_info = audio.get_device_info_by_index(i)
+        if (
+            0 < device_info["maxInputChannels"] and
+            device_info["hostApi"] == default_host_api_index
+        ):
+            print(f"Index: {device_info['index']}, Name: {device_info['name']}")
 
 
-        async def run():
-            CHUNK = 480
-            FORMAT = pyaudio.paInt16
-            CHANNELS = 1
-
-            audio = pyaudio.PyAudio()
-            stream = audio.open(
-                format=FORMAT,
-                channels=CHANNELS,
-                rate=SAMPLING_RATE,
-                input=True,
-                input_device_index=selected_device_index,
-                frames_per_buffer=CHUNK,
-            )
-
-            print("Listening...")
-            #process_loop(stream)
-            await loop.run_in_executor(None, process_loop, stream)
+    # 対象のDeviceIndexを入力
+    selected_device_index = int(input("対象のDeviceIndexを入力してください: "))
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    exe = ThreadPoolExecutor(1)
+    exe.submit(loop.run_forever)
 
 
 
-        # 文字起こしを開始
-        loop.create_task(run())
+    audio = pyaudio.PyAudio()
+    stream = audio.open(
+        format=pyaudio.paInt16,
+        channels=CHANNELS,
+        rate=SAMPLING_RATE,
+        input=True,
+        input_device_index=selected_device_index,
+    )
 
-        while True:
-            await asyncio.sleep(10)
 
-
-    asyncio.run(main())
-    #asyncio.get_event_loop().run_until_complete(main())
+    print("Listening...")
+    while True:
+        audio = stream.read(CHUNK)
+        asyncio.run_coroutine_threadsafe(transcriber.from_packet(audio), loop)
