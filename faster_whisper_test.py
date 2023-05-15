@@ -1,15 +1,16 @@
 import pyaudio
-import wave
 import asyncio
 import webrtcvad
 import pyaudio
 import time
 import numpy as np
+import soundcard as sc
 
 from ctranslate2 import get_cuda_device_count
 from typing import List, Union, Optional, Literal
 from concurrent.futures import ThreadPoolExecutor
 from faster_whisper import WhisperModel
+from faster_whisper.utils import _MODELS
 
 
 
@@ -116,6 +117,36 @@ class RealtimeAudioTranscriber:
         return await self.whisper.async_transcribe(audio)
 
 
+
+    async def from_packet_float(self, audio:Union[bytes,np.ndarray]):
+        """
+        サンプリングレートは 16000Hz
+        ビット数は float32にしてくれよん
+
+        Parameters
+        ----------
+        audio : Union[bytes,np.ndarray]
+            オーディオパケットぷりーず
+        """
+        audio_byte: Optional[bytes] = None
+        audio_np: Optional[np.ndarray] = None
+        if isinstance(audio, bytes):
+            audio_np = np.frombuffer(audio, dtype=np.float32)
+
+        else:
+            audio_np = audio
+
+        audio_byte = (audio_np * 32768.0).astype(np.int16).tobytes()        
+        #print(f'{len(self.speech_buffer)} : {len(self.packet_buffer)}')
+        is_speech = self.vad.is_speech(audio_byte, SAMPLING_RATE)
+        
+        if is_speech:
+            await self._is_speech_packet(audio_np)
+
+
+
+
+
     async def from_packet(self, audio:Union[bytes,np.ndarray]):
         """
         サンプリングレートは 16000Hz
@@ -141,14 +172,19 @@ class RealtimeAudioTranscriber:
         if is_speech:
             if not isinstance(audio_np, np.ndarray):
                 audio_np = np.frombuffer(audio_byte, dtype=np.int16)
-            if self.packet_size == None:
-                self.packet_size = audio_np.size / SAMPLING_RATE * 1000
             audio_np = audio_np.astype(np.float32) / 32768.0
-            self.packet_buffer.append({'data':audio_np, 'id':self.last_packet_id, 'time':time.perf_counter()})
-            self.last_packet_id += 1
-            if self.split_task == None:
-                loop = asyncio.get_event_loop()
-                self.split_task = loop.create_task(self._audio_split())
+            await self._is_speech_packet(audio_np)
+
+
+    async def _is_speech_packet(self, audio_np:np.ndarray):
+        if self.packet_size == None:
+            self.packet_size = audio_np.size / SAMPLING_RATE * 1000
+        self.packet_buffer.append({'data':audio_np, 'id':self.last_packet_id, 'time':time.perf_counter()})
+        self.last_packet_id += 1
+        if self.split_task == None:
+            loop = asyncio.get_event_loop()
+            self.split_task = loop.create_task(self._audio_split())
+
 
 
     async def _audio_split(self):
@@ -223,11 +259,25 @@ class RealtimeAudioTranscriber:
 
 if __name__ == "__main__":
 
-    transcriber = RealtimeAudioTranscriber(whisper_module='small')
+
+    print('whisper module (文字起こし精度) : ',_MODELS)
+    module = input('精度選択（初期設定 base）: ')
+    if not module in _MODELS:
+        module = 'base'
+
+    if get_cuda_device_count() == 0:
+        _cuda = 'Disable'
+    else:
+        _cuda = 'Enable'
+    print(f' CUDA is {_cuda}')
+    print('')
+
+    transcriber = RealtimeAudioTranscriber(whisper_module=module)
 
     print("使用可能なオーディオデバイス:")
     audio = pyaudio.PyAudio()
     device_count = audio.get_device_count()
+    last_count = 0
     default_host_api_index = audio.get_default_host_api_info()["index"]
 
     for i in range(device_count):
@@ -236,8 +286,9 @@ if __name__ == "__main__":
             0 < device_info["maxInputChannels"] and
             device_info["hostApi"] == default_host_api_index
         ):
+            last_count += 1
             print(f"Index: {device_info['index']}, Name: {device_info['name']}")
-
+    print(f"Index: {last_count}, Name: システム音声")
 
     # 対象のDeviceIndexを入力
     selected_device_index = int(input("対象のDeviceIndexを入力してください: "))
@@ -246,19 +297,23 @@ if __name__ == "__main__":
     exe = ThreadPoolExecutor(1)
     exe.submit(loop.run_forever)
 
-
-
-    audio = pyaudio.PyAudio()
-    stream = audio.open(
-        format=pyaudio.paInt16,
-        channels=CHANNELS,
-        rate=SAMPLING_RATE,
-        input=True,
-        input_device_index=selected_device_index,
-    )
-
-
     print("Listening...")
-    while True:
-        audio = stream.read(CHUNK)
-        asyncio.run_coroutine_threadsafe(transcriber.from_packet(audio), loop)
+    if selected_device_index == last_count:
+        with sc.get_microphone(id=str(sc.default_speaker().name), include_loopback=True).recorder(samplerate=SAMPLING_RATE, channels=1) as mic:
+            while True:
+                data = mic.record(numframes=CHUNK).reshape(-1)
+                asyncio.run_coroutine_threadsafe(transcriber.from_packet_float(data), loop)
+
+
+    else:
+        audio = pyaudio.PyAudio()
+        stream = audio.open(
+            format=pyaudio.paInt16,
+            channels=CHANNELS,
+            rate=SAMPLING_RATE,
+            input=True,
+            input_device_index=selected_device_index,
+        )
+        while True:
+            audio = stream.read(CHUNK)
+            asyncio.run_coroutine_threadsafe(transcriber.from_packet(audio), loop)

@@ -1,3 +1,4 @@
 faster-whisper
 webrtcvad
 pyaudio
+soundcard
